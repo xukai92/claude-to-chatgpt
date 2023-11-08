@@ -2,10 +2,11 @@ import httpx
 import time
 import json
 import os
+import boto3
 from fastapi import Request
 from claude_to_chatgpt.util import num_tokens_from_string
 from claude_to_chatgpt.logger import logger
-from claude_to_chatgpt.models import model_map
+from claude_to_chatgpt.models import modelId_map
 
 role_map = {
     "system": "Human",
@@ -23,6 +24,9 @@ class ClaudeAdapter:
     def __init__(self, claude_base_url="https://api.anthropic.com"):
         self.claude_api_key = os.getenv("CLAUDE_API_KEY", None)
         self.claude_base_url = claude_base_url
+
+        self.bedrock = boto3.client(region_name="us-east-1", service_name="bedrock-runtime")
+        self.fallback_model = "anthropic.claude-instant-v1"
 
     def get_api_key(self, headers):
         auth_header = headers.get("authorization", None)
@@ -42,13 +46,13 @@ class ClaudeAdapter:
         return prompt
 
     def openai_to_claude_params(self, openai_params):
-        model = model_map.get(openai_params["model"], "claude-2")
+        # model = model_map.get(openai_params["model"], "claude-2")
         messages = openai_params["messages"]
 
         prompt = self.convert_messages_to_prompt(messages)
 
         claude_params = {
-            "model": model,
+            # "model": model,
             "prompt": prompt,
             "max_tokens_to_sample": 100000,
         }
@@ -62,8 +66,8 @@ class ClaudeAdapter:
         if openai_params.get("temperature"):
             claude_params["temperature"] = openai_params.get("temperature")
 
-        if openai_params.get("stream"):
-            claude_params["stream"] = True
+        # if openai_params.get("stream"):
+        #     claude_params["stream"] = True
 
         return claude_params
 
@@ -128,69 +132,43 @@ class ClaudeAdapter:
 
     async def chat(self, request: Request):
         openai_params = await request.json()
-        headers = request.headers
         claude_params = self.openai_to_claude_params(openai_params)
-        api_key = self.get_api_key(headers)
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            if not claude_params.get("stream", False):
-                response = await client.post(
-                    f"{self.claude_base_url}/v1/complete",
-                    headers={
-                        "x-api-key": api_key,
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                        "anthropic-version": "2023-06-01",
-                    },
-                    json=claude_params,
-                )
-                if response.is_error:
-                    raise Exception(f"Error: {response.status_code}")
-                claude_response = response.json()
-                openai_response = self.claude_to_chatgpt_response(claude_response)
-                yield openai_response
-            else:
-                async with client.stream(
-                    "POST",
-                    f"{self.claude_base_url}/v1/complete",
-                    headers={
-                        "x-api-key": api_key,
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                        "anthropic-version": "2023-06-01",
-                    },
-                    json=claude_params,
-                ) as response:
-                    if response.is_error:
-                        raise Exception(f"Error: {response.status_code}")
-                    async for line in response.aiter_lines():
-                        if line:
-                            stripped_line = line.lstrip("data:")
-                            if stripped_line:
-                                try:
-                                    decoded_line = json.loads(stripped_line)
-                                    stop_reason = decoded_line.get("stop_reason")
-                                    if stop_reason:
-                                        yield self.claude_to_chatgpt_response_stream(
-                                            {
-                                                "completion": "",
-                                                "stop_reason": stop_reason,
-                                            }
-                                        )
-                                        yield "[DONE]"
-                                    else:
-                                        completion = decoded_line.get("completion")
-                                        if completion:
-                                            openai_response = (
-                                                self.claude_to_chatgpt_response_stream(
-                                                    decoded_line
-                                                )
-                                            )
-                                            yield openai_response
-                                except json.JSONDecodeError as e:
-                                    logger.debug(
-                                        f"Error decoding JSON: {e}"
-                                    )  # Debug output
-                                    logger.debug(
-                                        f"Failed to decode line: {stripped_line}"
-                                    )  # Debug output
+        if not openai_params.get("stream", False):
+            response = self.bedrock.invoke_model(
+                modelId=modelId_map.get(openai_params["model"], self.fallback_model),
+                body=json.dumps(claude_params), 
+                accept="application/json", 
+                contentType="application/json", 
+            )
+            if response is None:
+                raise Exception(f"Error: {response.status_code}")
+            claude_response = json.loads(response.get("body").read())
+            openai_response = self.claude_to_chatgpt_response(claude_response)
+            yield openai_response
+        else:
+            response = self.bedrock.invoke_model_with_response_stream(
+                modelId=modelId_map.get(openai_params["model"], self.fallback_model),
+                body=json.dumps(claude_params), 
+            )
+            if response is None:
+                raise Exception(f"Error: {response.status_code}")
+            stream = response.get("body")
+            if stream:
+                for event in stream:
+                    chunk = event.get("chunk")
+                    if chunk:
+                        chunk_decoded = json.loads(chunk.get("bytes").decode())
+                        # logger.info(chunk_decoded)
+                        yield self.claude_to_chatgpt_response_stream(
+                            chunk_decoded
+                        )
+                        stop_reason = chunk_decoded["stop_reason"]
+                        if stop_reason:
+                            yield self.claude_to_chatgpt_response_stream(
+                                {
+                                    "completion": "",
+                                    "stop_reason": stop_reason,
+                                }
+                            )
+                            yield "[DONE]"

@@ -103,3 +103,11 @@ model_map = {
     "gpt-4": "claude-2",
     "gpt-4-0613": "claude-2",
 }
+
+modelId_map = {
+    "gpt-3.5-turbo": "anthropic.claude-instant-v1",
+    "gpt-3.5-turbo-0613": "anthropic.claude-instant-v1",
+    "gpt-3.5": "anthropic.claude-v1",
+    "gpt-4": "anthropic.claude-v2",
+    "gpt-4-0613": "anthropic.claude-v2",
+}
